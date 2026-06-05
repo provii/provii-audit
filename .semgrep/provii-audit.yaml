@@ -1,0 +1,109 @@
+rules:
+
+  # ==========================================================================
+  # RULE 1: panic! / todo! / unimplemented! in library code
+  # ==========================================================================
+  # Explicit panic macros in non-test library code crash Workers at runtime.
+  # Return a Result with an appropriate error variant instead.
+  - id: provii.audit.explicit-panic-in-lib
+    patterns:
+      - pattern-either:
+          - pattern: panic!(...)
+          - pattern: todo!(...)
+          - pattern: unimplemented!(...)
+      - pattern-not-inside: |
+          #[test]
+          fn $TEST_FN(...) { ... }
+    paths:
+      exclude:
+        - "**/target/**"
+        - "**/benches/**"
+        - "**/tools/**"
+        - "**/examples/**"
+        - "**/fuzz/**"
+    message: >
+      Explicit panic/todo/unimplemented in library code. This will crash
+      the Worker at runtime. Return a Result with an appropriate error.
+    languages: [rust]
+    severity: ERROR
+    metadata:
+      category: correctness
+      subcategory: panic-safety
+      cwe: "CWE-248: Uncaught Exception"
+
+  # ==========================================================================
+  # RULE 2: Debug output in library code (non-test only)
+  # ==========================================================================
+  # println!, eprintln!, and dbg! in library code can leak sensitive
+  # audit event data. Use structured logging (tracing, worker::console_log)
+  # instead.
+  - id: provii.audit.debug-output-in-lib
+    patterns:
+      - pattern-either:
+          - pattern: println!(...)
+          - pattern: eprintln!(...)
+          - pattern: dbg!(...)
+      - pattern-not-inside: |
+          #[test]
+          fn $TEST_FN(...) { ... }
+    paths:
+      exclude:
+        - "**/target/**"
+        - "**/benches/**"
+        - "**/tools/**"
+        - "**/examples/**"
+        - "**/fuzz/**"
+    message: >
+      Debug output (println/eprintln/dbg) in library code may leak
+      audit event data. Remove or use structured logging.
+    languages: [rust]
+    severity: WARNING
+    metadata:
+      category: security
+      subcategory: information-leak
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+
+  # ==========================================================================
+  # RULE 3: Non-constant-time equality on secret byte arrays
+  # ==========================================================================
+  # Direct == on variables with names suggesting secrets, MACs, or tokens.
+  - id: provii.audit.non-ct-byte-comparison
+    pattern-regex: '(?:signature|hmac|mac_tag|token|secret|auth_tag|api_key)\w*\s*==\s*(?:signature|hmac|mac_tag|token|secret|auth_tag|api_key)'
+    paths:
+      exclude:
+        - "**/target/**"
+        - "**/tools/**"
+        - "**/examples/**"
+    message: >
+      Direct == comparison on values that appear to be secrets, MACs, or
+      API keys. Use crypto.subtle.timingSafeEqual or subtle::ConstantTimeEq
+      to prevent timing side-channels.
+    languages: [rust]
+    severity: ERROR
+    metadata:
+      category: security
+      subcategory: timing-attack
+      cwe: "CWE-208: Observable Timing Discrepancy"
+
+  # ==========================================================================
+  # RULE 4: Unsafe code blocks
+  # ==========================================================================
+  # provii-audit should not require unsafe code. Flag any unsafe block
+  # for explicit justification.
+  - id: provii.audit.unsafe-usage
+    pattern: unsafe { ... }
+    paths:
+      exclude:
+        - "**/target/**"
+        - "**/benches/**"
+        - "**/tools/**"
+        - "**/examples/**"
+    message: >
+      Unsafe code in provii-audit requires explicit justification.
+      Add a SAFETY comment and suppress with nosemgrep if justified.
+    languages: [rust]
+    severity: ERROR
+    metadata:
+      category: security
+      subcategory: memory-safety
+      cwe: "CWE-119: Improper Restriction of Operations within Memory Buffer"

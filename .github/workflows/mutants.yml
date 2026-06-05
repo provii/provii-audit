@@ -1,0 +1,85 @@
+# cargo-mutants for provii-audit (crate in rust/). Verifies tests KILL mutations, gated at 70%.
+# Weekly (full) + PR (changed files). Standalone lib: no sibling path-deps to clone.
+name: Mutation Testing
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'   # Mondays 05:00 UTC
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/src/**/*.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: github.actor != 'dependabot[bot]'
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false }   # PR diff vs origin/main
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: stable, targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: ci-mutants }
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked --version '=27.0.0'
+      - name: Run cargo-mutants (PR, changed files only)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -uo pipefail
+          # diff is repo-relative; strip the rust/ prefix for --file (cwd is rust/).
+          CHANGED=$(git -C "$GITHUB_WORKSPACE" diff --name-only origin/main...HEAD -- 'rust/src/**/*.rs' | sed 's#^rust/##' | paste -sd, -)
+          if [ -z "$CHANGED" ]; then echo "No provii-audit sources changed; skipping."; exit 0; fi
+          set +e
+          cargo mutants --in-place --package provii-audit --timeout 300 --file "$CHANGED" -- --target x86_64-unknown-linux-gnu
+          ec=$?; set -e
+          if [ "$ec" -ne 0 ] && [ "$ec" -ne 2 ]; then echo "::error::cargo-mutants exited $ec (build/baseline failure)"; exit "$ec"; fi
+      - name: Run cargo-mutants (scheduled/dispatch, full)
+        if: github.event_name != 'pull_request'
+        run: |
+          set -uo pipefail
+          set +e
+          cargo mutants --in-place --package provii-audit --timeout 300 -- --target x86_64-unknown-linux-gnu
+          ec=$?; set -e
+          if [ "$ec" -ne 0 ] && [ "$ec" -ne 2 ]; then echo "::error::cargo-mutants exited $ec (build/baseline failure)"; exit "$ec"; fi
+      - name: Enforce mutation score threshold
+        run: |
+          set -euo pipefail
+          THRESHOLD=70
+          OUTCOMES="mutants.out/outcomes.json"
+          if [ ! -f "$OUTCOMES" ]; then echo "::warning::No outcomes.json (mutants skipped)."; exit 0; fi
+          TOTAL=$(jq '[.outcomes[] | select(.scenario != "Baseline")] | length' "$OUTCOMES")
+          if [ "$TOTAL" -eq 0 ]; then echo "::warning::Zero mutants generated; nothing to enforce."; exit 0; fi
+          CAUGHT=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "CaughtMutant")] | length' "$OUTCOMES")
+          TIMEOUT=$(jq '[.outcomes[] | select(.scenario != "Baseline") | select(.summary == "Timeout")] | length' "$OUTCOMES")
+          KILLED=$((CAUGHT + TIMEOUT))
+          SCORE=$(echo "scale=2; $KILLED * 100 / $TOTAL" | bc)
+          echo "Mutation score: ${SCORE}% (${KILLED}/${TOTAL} killed)"
+          echo "## Mutation Testing" >> "$GITHUB_STEP_SUMMARY"
+          echo "Score: **${SCORE}%** (${KILLED}/${TOTAL} killed, threshold ${THRESHOLD}%)" >> "$GITHUB_STEP_SUMMARY"
+          if (( $(echo "$SCORE < $THRESHOLD" | bc -l) )); then echo "::error::Mutation score ${SCORE}% below ${THRESHOLD}%"; exit 1; fi
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-results
+          path: rust/mutants.out/
+          retention-days: 14
+          if-no-files-found: ignore

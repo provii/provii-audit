@@ -1,0 +1,98 @@
+[package]
+name = "provii-audit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Tim O'Connor <tom@maelstrom.au>"]
+description = "Shared audit logging library for Provii services. Privacy-preserving HMAC hashing, Cloudflare Queue dispatch, D1 digest chain verification."
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/provii/provii-audit"
+readme = "../README.md"
+publish = false
+categories = ["web-programming", "cryptography"]
+keywords = ["audit", "logging", "cloudflare-workers", "hmac", "privacy"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Cloudflare Workers runtime (queue feature enables Queue producer type)
+worker = { version = "0.7.4", features = ["queue"] }
+
+# Serialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography (consumer digest chain)
+sha2 = "0.11"
+hmac = "0.13"
+hex = "0.4"
+
+# Random number generation (WASM-compatible with `js` feature)
+getrandom = { version = "0.2", features = ["js"] }
+
+# Secret zeroisation
+zeroize = { version = "1.7", features = ["derive"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Pinned for wasm-bindgen ABI version compatibility across worker/js-sys/serde-wasm-bindgen.
+wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# Error handling
+thiserror = "2.0"
+
+[features]
+default = []
+# Consumer module: D1 batch insert + digest computation logic.
+# Only needed by the provii-audit-consumer worker, not by producer repos.
+consumer = []
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["full", "test-util"] }
+proptest = "1.4"
+
+# Recognised custom cfg values (suppresses unexpected_cfgs warnings).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+# Security-focused lints (OWASP ASVS V15.2.2)
+[lints.clippy]
+# Lint groups (processed first due to lower priority)
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
+# Critical security lints (deny - override groups)
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Memory safety (warn)
+mem_forget = "warn"
+missing_safety_doc = "warn"
+undocumented_unsafe_blocks = "warn"
+
+# Integer/float arithmetic (warn)
+arithmetic_side_effects = "warn"
+float_arithmetic = "warn"
+cast_possible_truncation = "warn"
+cast_precision_loss = "warn"
+cast_sign_loss = "warn"
+
+# Array indexing (warn)
+indexing_slicing = "warn"
+
+[profile.release]
+# Optimize for size (important for Cloudflare Workers)
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

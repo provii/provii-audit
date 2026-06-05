@@ -1,0 +1,41 @@
+# Zizmor configuration — RUST-LIB profile (provii-audit, provii-crypto, provii-audit-consumer).
+# Each suppression documents WHY it is acceptable so a maintainer can re-evaluate rather than treat
+# it as opaque noise. Anything not listed is still a hard fail.
+#
+# NOTE: this differs from the js-worker profile only in WHICH publishing workflow is carved out —
+# rust-lib repos publish via release.yml (SLSA + cargo build cache), js-workers via deploy.yml.
+
+rules:
+  dangerous-triggers:
+    # cla.yml uses pull_request_target + issue_comment so the CLA Assistant action can write back to
+    # the PR. It inspects only PR metadata + the comment body, never checks out PR-author code. This
+    # is the documented usage pattern from contributor-assistant/github-action.
+    ignore:
+      - cla.yml
+
+  unpinned-uses:
+    # release.yml references the SLSA reusable generator by TAG (@v2.1.0), not SHA: the generator
+    # validates its own ref at runtime and refuses to run from a SHA pin (SLSA spec). It is the only
+    # unpinned use in the repo.
+    ignore:
+      - release.yml
+
+  dependabot-cooldown:
+    # No cooldown: security patches land as soon as they are published (infra cadence, not a
+    # product-feature monorepo).
+    ignore:
+      - dependabot.yml
+
+  archived-uses:
+    # contributor-assistant/github-action is archived but still functional and SHA-pinned. No
+    # maintained alternative exists.
+    ignore:
+      - cla.yml
+
+  cache-poisoning:
+    # release.yml is TAG/workflow_dispatch-triggered only — no pull_request event ever runs it, so no
+    # PR-controlled cache can be planted for the release build to restore. The Swatinem/rust-cache
+    # (build job) and actions/setup-node (publish-provenance; no `cache:` input set) findings are
+    # therefore not reachable by an attacker. Re-evaluate if release.yml is ever run on pull_request.
+    ignore:
+      - release.yml

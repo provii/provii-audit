@@ -1,0 +1,205 @@
+# CANONICAL RUST-LIB ci.yml  (provii-audit, provii-audit-consumer, provii-crypto)
+# Rust library CI. NO deploy/release here (see profiles/rust-lib/release.yml).
+# Placeholders to fill per repo:
+#   rust  working dir for the crate/workspace (e.g. `rust`, or `.` for a workspace root)
+#   1.85       minimum supported Rust version (e.g. 1.85)
+#   --all-features what to build/test (e.g. --workspace, or --all-features for a single crate)
+# If the repo has sibling path-dependencies (provii-audit-consumer -> provii-audit,
+# *-> provii-crypto), add a "Clone <dep> (pin tag + verify SHA)" step after checkout in
+# every compiling job, mirroring the existing repos. Omitted here for brevity; see
+# provii-mobile-sdk/ci.yml for the canonical clone+SHA-verify block.
+name: CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE*', '.gitignore', 'CHANGELOG*']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE*', '.gitignore', 'CHANGELOG*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  fmt:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: stable, components: rustfmt }
+      - name: Check formatting
+        working-directory: rust
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy Lints (native + wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "ci-clippy" }
+      - name: Clippy (native)
+        working-directory: rust
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - name: Clippy (wasm32-unknown-unknown)
+        working-directory: rust
+        # The wasm-only code (Cloudflare Worker queue sink) trips clippy::nursery lints that are
+        # inherent to single-threaded wasm (future_not_send: js-sys futures are !Send) or pedantic
+        # (missing_const_for_fn). Native clippy above still enforces nursery on the shared code, so
+        # allow the nursery group on the wasm32 target only.
+        run: cargo clippy --target wasm32-unknown-unknown --all-features --locked -- -D warnings -A clippy::nursery
+
+  test:
+    name: Unit + Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: stable }
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "ci-test" }
+      - name: Verify Cargo.lock is current
+        working-directory: rust
+        run: cargo check --all-features --locked
+      - name: Run lib + integration tests
+        working-directory: rust
+        # --all-targets covers unit (lib), integration (tests/), and doctests stay
+        # on the docs job. Locked so CI fails if Cargo.lock drifts.
+        run: cargo test --all-targets --all-features --locked
+
+  msrv:
+    name: MSRV Check (1.85)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: "1.85" }
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "ci-msrv" }
+      - name: Verify MSRV compiles
+        working-directory: rust
+        run: cargo check --all-features --locked
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: stable }
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "ci-docs" }
+      - name: Build documentation (deny warnings)
+        working-directory: rust
+        run: cargo doc --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  coverage:
+    name: Test Coverage (85% gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [test]
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with: { toolchain: stable, components: llvm-tools-preview }
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "ci-coverage" }
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version =0.6.16   # <PIN: one version org-wide>
+      - name: Generate coverage report
+        working-directory: rust
+        run: cargo llvm-cov --lib --all-features --locked --lcov --output-path lcov.info
+      - name: Check coverage threshold (85%)
+        working-directory: rust
+        run: |
+          set -euo pipefail
+          COVERAGE=$(cargo llvm-cov --lib --all-features --locked 2>&1 | grep "^TOTAL" | awk '{print $NF}' | tr -d '%')
+          echo "Line coverage: ${COVERAGE}%"
+          {
+            echo "## Coverage Report"
+            echo "Line coverage: **${COVERAGE}%** (threshold: 85%)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( $(echo "${COVERAGE} < 85" | bc -l) )); then
+            echo "::error::Coverage ${COVERAGE}% is below the 85% threshold"
+            exit 1
+          fi
+          echo "Coverage ${COVERAGE}% meets the 85% threshold"
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with: { name: coverage-report, path: rust/lcov.info, retention-days: 14 }
+
+  # ======================================================================
+  # Sentinel -- single required status check for branch protection.
+  # NOTE: cross-workflow jobs (security-audit.yml, etc.) cannot be `needs`d
+  # here; require their summary checks in branch protection too.
+  # ======================================================================
+  ci-success:
+    name: CI Success
+    needs: [fmt, clippy, test, msrv, docs, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "One or more CI jobs did not succeed"
+          echo "fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} test=${{ needs.test.result }}"
+          echo "msrv=${{ needs.msrv.result }} docs=${{ needs.docs.result }} coverage=${{ needs.coverage.result }}"
+          exit 1
+      - name: All checks passed
+        run: echo "All required CI jobs passed successfully"

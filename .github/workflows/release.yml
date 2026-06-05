@@ -1,0 +1,446 @@
+# CANONICAL RUST-LIB release.yml  (provii-audit, provii-audit-consumer, provii-crypto)
+# Tag v*.*.* (or workflow_dispatch dry_run) -> security-gate -> build -> changelog ->
+# package (source tarball + SHA256SUMS) -> sbom (cargo-sbom: SPDX + CycloneDX) ->
+# sign-artifacts (cosign keyless, new bundle format) -> slsa (slsa-github-generator
+# generator_generic_slsa3.yml@v2.1.0) -> create GH release.
+#
+# Locked decisions baked in: tag pattern v*.*.*; NO git verify-tag (signing deferred,
+# README #4); SHA-pinned third-party actions; cosign KEYLESS; SLSA v2.1.0; --locked
+# everywhere for reproducibility.
+#
+# R2 split (README #2): the GitHub release is the primary deliverable. The PROVENANCE
+# record (DSSE .intoto.jsonl, .sig, SBOMs) MAY ALSO be mirrored to the **provii-api-specs**
+# bucket (provenance.provii.app) via the optional publish-provenance job below. A rust-lib
+# ships NO third-party-distributable binary, so it NEVER writes to the **cdn** bucket
+# (that is the sdk/cdn profiles only). cargo-sbom 0.10.0 is the single pinned generator.
+#
+# Placeholders per repo:
+#   provii-audit      crate / repo name (provii-audit, provii-crypto, ...)
+#   rust    working dir (e.g. `rust`, or `.` for a workspace root)
+#   stable build toolchain (`stable` or a pin like 1.87.0)
+# Add sibling path-dep clone+SHA-verify steps where the repo needs them (see ci.yml note).
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Test run: skip the GitHub release + provenance promotion, route any R2 writes to <repo>/test/<sha>/'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ======================================================================
+  # Security gate: audit deps before any artefact is built.
+  # ======================================================================
+  security-gate:
+    name: Security Audit Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - name: Verify Cargo.lock exists (reproducible-build prereq)
+        run: |
+          if [[ ! -f rust/Cargo.lock ]]; then
+            echo "::error::Cargo.lock missing - required for reproducible builds"
+            exit 1
+          fi
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version =0.22.1
+      - name: Run cargo audit
+        # Tag + main pushes enforce the gate; dry_run dispatch skips it so the
+        # provenance path can be exercised past transient low-severity advisories.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run == true) }}
+        working-directory: rust
+        run: cargo audit --deny warnings --deny unsound   # <ADJUST per-repo RUSTSEC ignores>
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version =0.19.6
+      - name: Run cargo deny
+        working-directory: rust
+        run: cargo deny check
+      - name: Reject wildcard dependencies
+        run: |
+          if grep -rE '^\s*version\s*=\s*"\*"' rust/Cargo.toml rust/*/Cargo.toml 2>/dev/null; then
+            echo "::error::Wildcard dependencies are not allowed - pin all versions"
+            exit 1
+          fi
+
+  # ======================================================================
+  # Build: compile (release + wasm32), run tests, all --locked.
+  # ======================================================================
+  build:
+    name: Build and Test
+    needs: security-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions: { contents: read }
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with: { workspaces: rust, shared-key: "release-build" }
+      - name: Verify lockfile integrity
+        working-directory: rust
+        run: cargo check --all-features --locked
+      - name: Build release (native)
+        working-directory: rust
+        run: cargo build --release --all-features --locked
+      - name: Build release (wasm32-unknown-unknown)
+        working-directory: rust
+        run: cargo build --release --target wasm32-unknown-unknown --all-features --locked
+      - name: Run tests
+        working-directory: rust
+        run: cargo test --all-features --locked
+
+  # ======================================================================
+  # Changelog: git-cliff, this version + full history.
+  # ======================================================================
+  changelog:
+    name: Generate Changelog
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Install git-cliff
+        run: cargo install git-cliff --locked --version =2.13.1
+      - name: Generate changelog
+        run: |
+          set -euo pipefail
+          git-cliff --latest --strip header > RELEASE_CHANGELOG.md
+          git-cliff --tag "${GITHUB_REF_NAME}" > CHANGELOG_FULL.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: changelog
+          path: |
+            RELEASE_CHANGELOG.md
+            CHANGELOG_FULL.md
+          retention-days: 1
+
+  # ======================================================================
+  # Package: reproducible source tarball (git archive) + SHA256SUMS.
+  # Outputs the base64 multi-subject hash consumed by the SLSA generator.
+  # ======================================================================
+  package:
+    name: Package Source
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    outputs:
+      archive-name: ${{ steps.archive.outputs.name }}
+      subjects-base64: ${{ steps.hash.outputs.subjects }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { fetch-depth: 0, persist-credentials: false }
+      - name: Create source archive
+        id: archive
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE_NAME="provii-audit-${VERSION}.tar.gz"
+          mkdir -p release-artifacts
+          # git archive => byte-reproducible source tarball from the tagged tree.
+          git archive --format=tar.gz --prefix="provii-audit-${VERSION}/" HEAD > "release-artifacts/${ARCHIVE_NAME}"
+          echo "name=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
+      - name: Generate SHA256SUMS
+        id: hash
+        working-directory: release-artifacts
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz > SHA256SUMS
+          sha512sum *.tar.gz > SHA512SUMS
+          # SLSA generator expects base64("<sha256hex>  <name>\n"...) of every subject.
+          echo "subjects=$(base64 -w0 < SHA256SUMS)" >> "$GITHUB_OUTPUT"
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-archive
+          path: release-artifacts/
+          retention-days: 1
+
+  # ======================================================================
+  # SBOM: cargo-sbom 0.10.0 (the LOCKED Rust generator) -> SPDX + CycloneDX.
+  # ======================================================================
+  sbom:
+    name: Generate SBOM (SPDX + CycloneDX)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: { persist-credentials: false }
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom --locked --version =0.10.0   # LOCKED: one Rust SBOM generator org-wide
+      - name: Generate CycloneDX 1.6 SBOM
+        working-directory: rust
+        run: cargo sbom --output-format cyclone_dx_json_1_6 > "$GITHUB_WORKSPACE/sbom.cyclonedx.json"
+      - name: Generate SPDX 2.3 SBOM
+        working-directory: rust
+        run: cargo sbom --output-format spdx_json_2_3 > "$GITHUB_WORKSPACE/sbom.spdx.json"
+      - name: Validate CycloneDX is spec-compliant
+        run: |
+          set -euo pipefail
+          jq -e '.bomFormat == "CycloneDX" and (.specVersion == "1.6") and (.components | length > 0)' \
+            sbom.cyclonedx.json > /dev/null
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
+          retention-days: 1
+
+  # ======================================================================
+  # Sign: cosign KEYLESS sign-blob, NEW Sigstore bundle format (.sig).
+  # ======================================================================
+  # UPLIFT (backported from provii-crypto): GitHub-native artifact attestation, separate from SLSA.
+  # The source tarball gets a provenance attestation verifiable with `gh attestation verify`.
+  attestation:
+    name: Build Attestation
+    needs: [package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - name: Download source archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: source-archive, path: artifacts/ }
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: 'artifacts/*.tar.gz'
+
+  sign-artifacts:
+    name: Sign Artifacts (cosign keyless)
+    needs: [package, sbom]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC for keyless signing
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - name: Download source archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: source-archive, path: artifacts }
+      - name: Download SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: sbom, path: artifacts }
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with: { cosign-release: 'v2.5.3' }   # --new-bundle-format support
+      - name: Sign source tarball + SBOMs (Sigstore bundle, new format)
+        working-directory: artifacts
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for f in *.tar.gz sbom.cyclonedx.json sbom.spdx.json; do
+            [ -f "$f" ] || continue
+            cosign sign-blob --yes --new-bundle-format --bundle "${f}.sig" "$f"
+            python3 -c "import json; b=json.load(open('${f}.sig')); assert b.get('mediaType','').startswith('application/vnd.dev.sigstore.bundle'), b.get('mediaType')"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-artifacts
+          path: artifacts/
+          retention-days: 1
+
+  # ======================================================================
+  # SLSA Level 3 provenance via the reusable generator. Tag-pinned ref:
+  # the generator validates its own ref at runtime and refuses a SHA pin,
+  # so v2.1.0 stays a tag here (carve out in zizmor unpinned-uses).
+  # ======================================================================
+  slsa-provenance:
+    name: SLSA Provenance
+    needs: [package]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.package.outputs.subjects-base64 }}
+      upload-assets: false
+      # private-repository: true   # <ENABLE while the repo is still private>
+
+  # ======================================================================
+  # Release: create the GitHub release (tag-triggered only). The release is
+  # the canonical rust-lib deliverable; dry_run dispatch skips it.
+  # ======================================================================
+  release:
+    name: Create GitHub Release
+    needs: [sign-artifacts, changelog, slsa-provenance, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit }
+      - name: Download signed artefacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: signed-artifacts, path: release }
+      - name: Download changelog
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: changelog, path: release }
+      - name: Download SLSA provenance (.intoto.jsonl)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.slsa-provenance.outputs.provenance-name }}
+          path: release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          files: |
+            release/*.tar.gz
+            release/*.sig
+            release/SHA256SUMS
+            release/SHA512SUMS
+            release/sbom.cyclonedx.json
+            release/sbom.spdx.json
+            release/*.intoto.jsonl
+          body_path: release/RELEASE_CHANGELOG.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # ======================================================================
+  # OPTIONAL: mirror the PROVENANCE record to provii-api-specs
+  # (provenance.provii.app). This is the provenance bucket, NOT cdn. A
+  # rust-lib does NOT distribute binaries to third parties, so we publish
+  # the .sig / .intoto.jsonl / SBOMs (proof of "where it came from"), never
+  # the binary itself. wrangler r2 object put --remote with CLOUDFLARE_API_TOKEN
+  # (S3 access-keys return 401 in prod). Layout mirrors provii-crypto:
+  #   provii-api-specs/provii-audit/<version>/...        (sidecars + manifest)
+  #   provii-api-specs/provii-audit/latest/...           (tag triggers only)
+  #   provii-api-specs/provii-audit/test/<sha>/...        (dry_run)
+  # See provii-crypto release.yml `publish-r2-provenance` for the full job.
+  # ======================================================================
+  publish-provenance:
+    name: Publish provenance record to R2 (provii-api-specs)
+    needs: [sign-artifacts, slsa-provenance, release]
+    if: |
+      always() &&
+      needs.sign-artifacts.result == 'success' &&
+      needs.slsa-provenance.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.release.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: { contents: read }
+    env:
+      SERVICE: provii-audit
+      R2_BUCKET: provii-api-specs   # provenance bucket (provenance.provii.app) -- NOT cdn
+      WRANGLER_VERSION: '4.92.0'    # LOCKED org-wide pin
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with: { egress-policy: audit, disable-sudo: true }
+      - name: Download signed artefacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with: { name: signed-artifacts, path: provenance }
+      - name: Download SLSA provenance (.intoto.jsonl)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.slsa-provenance.outputs.provenance-name }}
+          path: provenance
+      - name: Resolve version + path prefix
+        id: ctx
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="dispatch-${{ github.sha }}"; DRY_RUN="${{ inputs.dry_run }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"; DRY_RUN="false"
+          fi
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "base_prefix=${SERVICE}/test/${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "promote_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "base_prefix=${SERVICE}/${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "promote_latest=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
+        with: { node-version: '22' }
+      - name: Install Wrangler
+        run: npm install -g wrangler@${{ env.WRANGLER_VERSION }} --ignore-scripts
+      - name: Upload provenance record (sidecars only -- no binary on cdn from here)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BASE_PREFIX: ${{ steps.ctx.outputs.base_prefix }}
+        run: |
+          set -euo pipefail
+          cd provenance
+          for f in *.sig; do
+            [ -f "$f" ] || continue
+            wrangler r2 object put "${R2_BUCKET}/${BASE_PREFIX}/${f}" --remote --file="$f" \
+              --content-type=application/vnd.dev.sigstore.bundle+json
+          done
+          for f in *.intoto.jsonl; do
+            [ -f "$f" ] || continue
+            wrangler r2 object put "${R2_BUCKET}/${BASE_PREFIX}/${f}" --remote --file="$f" \
+              --content-type=application/vnd.in-toto+json
+          done
+          for f in sbom.cyclonedx.json; do
+            [ -f "$f" ] || continue
+            wrangler r2 object put "${R2_BUCKET}/${BASE_PREFIX}/${f}" --remote --file="$f" \
+              --content-type=application/vnd.cyclonedx+json
+          done
+          # <PLACEHOLDER: build + upload a manifest.json (service, version, git_sha, subjects),
+          # and promote to provii-audit/latest/ when promote_latest == 'true'. See provii-crypto.>

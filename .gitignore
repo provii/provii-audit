@@ -1,0 +1,35 @@
+# Rust build artifacts
+/rust/target/
+
+# Fuzz testing artifacts
+/rust/fuzz/target/
+/rust/fuzz/corpus/
+/rust/fuzz/artifacts/
+
+# Coverage and profiling
+lcov.info
+*.profraw
+*.profdata
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Wrangler
+.wrangler/
+

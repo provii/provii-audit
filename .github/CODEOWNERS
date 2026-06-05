@@ -1,0 +1,7 @@
+* @tim-maelstrom
+
+/rust/src/ @tim-maelstrom
+/schema.sql @tim-maelstrom
+/.github/workflows/ @tim-maelstrom
+/rust/Cargo.toml @tim-maelstrom
+/rust/Cargo.lock @tim-maelstrom
