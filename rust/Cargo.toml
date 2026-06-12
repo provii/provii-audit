@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Cloudflare Workers runtime (queue feature enables Queue producer type)
-worker = { version = "0.7.4", features = ["queue"] }
+worker = { version = "0.8.4", features = ["queue"] }
 
 # Serialisation
 serde = { version = "1.0", features = ["derive"] }
