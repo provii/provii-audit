@@ -14,7 +14,7 @@
   <a href="https://github.com/provii/provii-audit/actions/workflows/ci.yml"><img src="https://github.com/provii/provii-audit/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/provii/provii-audit/actions/workflows/security-audit.yml"><img src="https://github.com/provii/provii-audit/actions/workflows/security-audit.yml/badge.svg" alt="Security audit"></a>
   <img src="https://img.shields.io/badge/licence-Proprietary-red" alt="Licence: Proprietary">
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="Rust 1.75+">
+  <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="Rust 1.85+">
 </p>
 
 ## Why this exists
@@ -59,7 +59,7 @@ Each `AuditEvent` carries 23 fields. The struct is defined in `rust/src/event.rs
 
 ### Deliberately excluded
 
-Raw IP addresses, raw user agent strings, raw origin headers, dates of birth, email addresses, names, document identifiers. The `strip_pii` function in `sanitize.rs` performs a defence in depth pass over free text fields, replacing IPv4 addresses, IPv6 addresses, email addresses, and date of birth patterns (years 1920 through 2012) with `[REDACTED_*]` placeholders.
+Raw IP addresses, raw user agent strings, raw origin headers, dates of birth, email addresses, names, document identifiers. The `strip_pii` function in `sanitize.rs` performs a defence in depth pass over free text fields, replacing IPv4 addresses, IPv6 addresses, email addresses, and date of birth patterns (years 1920 through 2013) with `[REDACTED_*]` placeholders.
 
 ## Usage
 
